@@ -7,6 +7,7 @@ from dspy.teleprompt import *
 from dspy.evaluate import Evaluate  # isort: skip
 from dspy.clients import *  # isort: skip
 from dspy.adapters import Adapter, ChatAdapter, JSONAdapter, XMLAdapter, TwoStepAdapter, Image, Audio, File, History, Type, Tool, ToolCalls, Code, Reasoning  # isort: skip
+from dspy.core import AsyncLMStream, Assistant, Developer, LMAudioDelta, LMAudioPart, LMAnyDelta, LMBasePart, LMBinaryPart, LMCacheConfig, LMCitationDelta, LMCitationPart, LMConfig, LMDelta, LMDocumentPart, LMHistoryEntry, LMImageDelta, LMImagePart, LMMessage, LMOutput, LMOutputBuilder, LMPart, LMPromptCacheConfig, LMReasoningConfig, LMRefusalPart, LMRequest, LMRequestPatch, LMResponse, LMSourcePart, LMStream, LMStreamDeltaEvent, LMStreamEndEvent, LMStreamErrorEvent, LMStreamEvent, LMStreamOutputEndEvent, LMStreamStartEvent, LMTextDelta, LMTextPart, LMThinkingDelta, LMThinkingPart, LMToolCallDelta, LMToolCallPart, LMToolChoice, LMToolResultPart, LMToolSpec, LMUsage, LMVideoPart, System, ToolCall, ToolResult, User  # isort: skip
 from dspy.primitives.sandbox_serializable import SandboxSerializable  # isort: skip
 from dspy.utils.exceptions import ContextWindowExceededError
 from dspy.utils.logging_utils import configure_dspy_loggers, disable_logging, enable_logging

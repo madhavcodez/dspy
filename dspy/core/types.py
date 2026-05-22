@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import mimetypes
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pprint import pformat
 from typing import Annotated, Any, Literal
-from urllib.parse import urlparse
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -156,7 +154,9 @@ class LMToolResultPart(LMBasePart):
         if isinstance(data, dict) and "content" in data:
             data = dict(data)
             content = data["content"]
-            if isinstance(content, list):
+            if content is None:
+                data["content"] = []
+            elif isinstance(content, list):
                 data["content"] = [_coerce_part(item) for item in content]
             else:
                 data["content"] = [_coerce_part(content)]
@@ -194,6 +194,9 @@ class LMRefusalPart(LMBasePart):
     text: str
 
 
+_SOURCE_KEYS = ("data", "url", "file_id", "path")
+
+
 LMPart = Annotated[
     LMTextPart
     | LMImagePart
@@ -227,26 +230,8 @@ class LMMessage(BaseModel):
             return data
         if isinstance(data, dict):
             data = dict(data)
-            if data.get("role") == "tool" and "parts" not in data:
-                content = data.pop("content", None)
-                call_id = data.pop("tool_call_id", None)
-                name = data.pop("name", None)
-                data["parts"] = [
-                    LMToolResultPart(
-                        call_id=call_id,
-                        name=name,
-                        content=_parts_from_openai_content(content),
-                    )
-                ]
-            elif "parts" not in data:
-                parts = _parts_from_openai_content(data.pop("content", None)) if "content" in data else []
-                if "tool_calls" in data:
-                    parts.extend(_tool_calls_from_openai(data.pop("tool_calls") or []))
-                data["parts"] = parts
-            else:
+            if "parts" in data:
                 data["parts"] = [_coerce_part(part) for part in data["parts"]]
-                if "tool_calls" in data:
-                    data["parts"].extend(_tool_calls_from_openai(data.pop("tool_calls") or []))
         return data
 
     @property
@@ -571,7 +556,7 @@ class LMRequestPatch:
         the way down. Message and part patches are intentionally not flattened
         here; they require the next adapter-call refactor.
         """
-        kwargs = self.config.model_dump(exclude_none=True) if self.config is not None else {}
+        kwargs = _lm_config_as_kwargs(self.config) if self.config is not None else {}
         if self.tools:
             kwargs["tools"] = list(self.tools)
         return kwargs
@@ -745,18 +730,6 @@ class LMOutput(BaseModel):
             return values[0]
         return values
 
-    def to_output_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"text": self.text}
-        if self.reasoning_content is not None:
-            data["reasoning_content"] = self.reasoning_content
-        if self.tool_calls:
-            data["tool_calls"] = [_tool_call_to_provider_dict(call) for call in self.tool_calls]
-        if self.citations:
-            data["citations"] = [citation.model_dump(exclude_none=True) for citation in self.citations]
-        if self.logprobs is not None:
-            data["logprobs"] = self.logprobs
-        return data
-
 
 class LMResponse(BaseModel):
     """The normalized result of one LM request."""
@@ -854,20 +827,12 @@ class LMResponse(BaseModel):
     def binaries(self) -> list[LMBinaryPart]:
         return self.output.binaries
 
+    @property
+    def refusal(self) -> str | None:
+        return self.output.refusal
+
     def to_values(self) -> list[Any]:
         return [output.to_value() for output in self.outputs]
-
-    def to_outputs(self) -> list[Any]:
-        outputs: list[Any] = []
-        for output in self.outputs:
-            if _requires_output_dict(output):
-                outputs.append(output.to_output_dict())
-            else:
-                outputs.append(output.to_value())
-        return outputs
-
-    def to_legacy_outputs(self) -> list[Any]:
-        return self.to_outputs()
 
     def usage_as_dict(self) -> dict[str, Any]:
         if self.usage is None:
@@ -878,14 +843,7 @@ class LMResponse(BaseModel):
 
 
 class LMHistoryEntry(BaseModel, Mapping[str, Any]):
-    """A typed history record that can be read like a dictionary.
-
-    Store the canonical request and response, then derive legacy convenience
-    fields such as `outputs`, `usage`, `messages`, and `kwargs` on demand.
-    Because this class implements `Mapping`, existing history code can keep
-    using `entry["messages"]`, `entry.get("prompt")`, `entry.items()`, and
-    `dict(entry)`.
-    """
+    """A typed history record that can be read like a dictionary."""
 
     request: LMRequest
     response: LMResponse
@@ -895,22 +853,13 @@ class LMHistoryEntry(BaseModel, Mapping[str, Any]):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
-    @model_validator(mode="before")
-    @classmethod
-    def drop_derived_fields(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            data = dict(data)
-            for key in _HISTORY_DERIVED_KEYS:
-                data.pop(key, None)
-        return data
+    @property
+    def outputs(self) -> list[LMOutput]:
+        return self.response.outputs
 
     @property
-    def outputs(self) -> list[Any]:
-        return self.response.to_outputs()
-
-    @property
-    def usage(self) -> dict[str, Any]:
-        return self.response.usage_as_dict()
+    def usage(self) -> LMUsage | dict[str, Any] | None:
+        return self.response.usage
 
     @property
     def cost(self) -> float | None:
@@ -922,15 +871,25 @@ class LMHistoryEntry(BaseModel, Mapping[str, Any]):
 
     @property
     def prompt(self) -> str | None:
-        return _history_request_prompt(self.request)
+        if len(self.request.messages) != 1:
+            return None
+        message = self.request.messages[0]
+        if message.role != "user" or len(message.parts) != 1:
+            return None
+        part = message.parts[0]
+        return part.text if isinstance(part, LMTextPart) else None
 
     @property
-    def messages(self) -> list[dict[str, Any]] | None:
-        return _history_request_messages_as_openai(self.request)
+    def messages(self) -> list[LMMessage]:
+        return self.request.messages
 
     @property
-    def kwargs(self) -> dict[str, Any]:
-        return _history_request_kwargs(self.request)
+    def tools(self) -> list[LMToolSpec]:
+        return self.request.tools
+
+    @property
+    def config(self) -> LMConfig:
+        return self.request.config
 
     @property
     def response_model(self) -> str | None:
@@ -981,7 +940,8 @@ _HISTORY_DERIVED_KEYS = (
     "model",
     "prompt",
     "messages",
-    "kwargs",
+    "tools",
+    "config",
     "response_model",
 )
 
@@ -1049,14 +1009,14 @@ class LMStreamStartEvent(LMStreamEvent):
 
 class LMStreamDeltaEvent(LMStreamEvent):
     type: Literal["delta"] = "delta"
-    output_index: int = 0
-    part_index: int
+    output_index: int = Field(default=0, ge=0)
+    part_index: int = Field(ge=0)
     delta: LMAnyDelta
 
 
 class LMStreamOutputEndEvent(LMStreamEvent):
     type: Literal["output_end"] = "output_end"
-    output_index: int = 0
+    output_index: int = Field(default=0, ge=0)
     finish_reason: str | None = None
     truncated: bool = False
 
@@ -1104,10 +1064,25 @@ class LMOutputBuilder:
         return None
 
     def to_response(self, *, usage: LMUsage | dict[str, Any] | None = None, cost: float | None = None) -> LMResponse:
-        max_index = max(self._parts.keys(), default=0)
+        output_indices = set(self._parts) | set(self._finish_reasons) | set(self._truncated)
+        if not output_indices:
+            output_indices = {0}
+        max_index = max(output_indices)
+        expected_indices = set(range(max_index + 1))
+        if output_indices != expected_indices:
+            missing = sorted(expected_indices - output_indices)
+            raise ValueError(f"Stream output indices must be contiguous from 0; missing indices: {missing}.")
+
         outputs = []
         for output_index in range(max_index + 1):
-            parts = [part for part in self._parts.get(output_index, []) if part is not None]
+            part_buffer = self._parts.get(output_index, [])
+            missing_part_indices = [index for index, part in enumerate(part_buffer) if part is None]
+            if missing_part_indices:
+                raise ValueError(
+                    f"Stream part indices for output {output_index} must be contiguous; "
+                    f"missing indices: {missing_part_indices}."
+                )
+            parts = [_finalize_stream_part(part) for part in part_buffer]
             outputs.append(
                 LMOutput(
                     parts=parts,
@@ -1125,12 +1100,18 @@ class LMOutputBuilder:
         current = parts[event.part_index]
         delta = event.delta
         if isinstance(delta, LMThinkingDelta):
+            if current is not None and not isinstance(current, LMThinkingPart):
+                raise ValueError("Cannot apply thinking delta to a non-thinking stream part.")
             text = (current.text if isinstance(current, LMThinkingPart) else "") + delta.text
             parts[event.part_index] = LMThinkingPart(text=text)
         elif isinstance(delta, LMTextDelta):
+            if current is not None and not isinstance(current, LMTextPart):
+                raise ValueError("Cannot apply text delta to a non-text stream part.")
             text = (current.text if isinstance(current, LMTextPart) else "") + delta.text
             parts[event.part_index] = LMTextPart(text=text)
         elif isinstance(delta, LMToolCallDelta):
+            if current is not None and not isinstance(current, LMToolCallPart):
+                raise ValueError("Cannot apply tool-call delta to a non-tool-call stream part.")
             buffer = ""
             if isinstance(current, LMToolCallPart):
                 buffer = current.provider_data.get("args_buffer", "")
@@ -1143,10 +1124,16 @@ class LMOutputBuilder:
                 provider_data={"args_buffer": buffer},
             )
         elif isinstance(delta, LMCitationDelta):
+            if current is not None and not isinstance(current, LMCitationPart):
+                raise ValueError("Cannot apply citation delta to a different stream part type.")
             parts[event.part_index] = delta.citation
         elif isinstance(delta, LMImageDelta):
+            if current is not None and not isinstance(current, LMImagePart):
+                raise ValueError("Cannot apply image delta to a different stream part type.")
             parts[event.part_index] = delta.image
         elif isinstance(delta, LMAudioDelta):
+            if current is not None and not isinstance(current, LMAudioPart):
+                raise ValueError("Cannot apply audio delta to a different stream part type.")
             parts[event.part_index] = delta.audio
 
 
@@ -1486,134 +1473,14 @@ def ToolResult(  # noqa: N802
     return LMMessage(role="tool", parts=[result])
 
 
-def _history_request_prompt(request: LMRequest) -> str | None:
-    if len(request.messages) != 1:
-        return None
-    message = request.messages[0]
-    if message.role != "user" or len(message.parts) != 1:
-        return None
-    part = message.parts[0]
-    return part.text if isinstance(part, LMTextPart) else None
-
-
-def _history_request_messages_as_openai(request: LMRequest) -> list[dict[str, Any]]:
-    messages = []
-    for message in request.messages:
-        if message.role == "assistant":
-            tool_calls = [part for part in message.parts if isinstance(part, LMToolCallPart)]
-            content_parts = [part for part in message.parts if not isinstance(part, LMToolCallPart)]
-            item: dict[str, Any] = {
-                "role": "assistant",
-                "content": _history_message_parts_as_openai_content(content_parts) if content_parts else None,
-            }
-            if tool_calls:
-                item["tool_calls"] = [_history_tool_call_as_openai(call) for call in tool_calls]
-        elif message.role == "tool" and len(message.parts) == 1 and isinstance(message.parts[0], LMToolResultPart):
-            result = message.parts[0]
-            item = {"role": "tool", "content": _history_tool_result_content(result)}
-            if result.call_id is not None:
-                item["tool_call_id"] = result.call_id
-            if result.name is not None:
-                item["name"] = result.name
-        else:
-            item = {
-                "role": message.role,
-                "content": _history_message_parts_as_openai_content(message.parts),
-            }
-        if message.name is not None and "name" not in item:
-            item["name"] = message.name
-        messages.append(item)
-    return messages
-
-
-def _history_tool_call_as_openai(call: LMToolCallPart) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "type": "function",
-        "function": {
-            "name": call.name,
-            "arguments": json.dumps(call.args),
-        },
-    }
-    if call.id is not None:
-        data["id"] = call.id
-    return data
-
-
-def _history_tool_result_content(result: LMToolResultPart) -> str:
-    chunks = []
-    for part in result.content:
-        if isinstance(part, LMTextPart):
-            chunks.append(part.text)
-        else:
-            chunks.append(json.dumps(part.model_dump(mode="json", exclude_none=True), ensure_ascii=False))
-    return "".join(chunks)
-
-
-def _history_message_parts_as_openai_content(parts: list[LMPart]) -> str | list[dict[str, Any]]:
-    if len(parts) == 1 and isinstance(parts[0], LMTextPart):
-        return parts[0].text
-    return [_history_part_as_openai_content(part) for part in parts]
-
-
-def _history_part_as_openai_content(part: LMPart) -> dict[str, Any]:
-    if isinstance(part, LMTextPart):
-        return {"type": "text", "text": part.text}
-    if isinstance(part, LMImagePart):
-        return {"type": "image_url", "image_url": {"url": _history_part_source(part)}}
-    if isinstance(part, LMAudioPart):
-        return {
-            "type": "input_audio",
-            "input_audio": {"data": _history_part_source(part), "format": _history_media_format(part.media_type)},
-        }
-    if isinstance(part, LMVideoPart):
-        return {"type": "video", "video": {"url": _history_part_source(part), "media_type": part.media_type}}
-    if isinstance(part, LMDocumentPart):
-        data = {"type": "document"}
-        if part.source is not None:
-            data["source"] = part.source
-        else:
-            data["source"] = _history_part_source(part)
-            data["media_type"] = part.media_type
-        if part.citations:
-            data["citations"] = part.citations
-        if part.title is not None:
-            data["title"] = part.title
-        if part.context is not None:
-            data["context"] = part.context
-        return data
-    if isinstance(part, LMBinaryPart):
-        return {
-            "type": "binary",
-            "binary": {
-                key: value
-                for key, value in {
-                    "data": _history_part_source(part),
-                    "file_id": part.file_id,
-                    "filename": part.filename,
-                    "media_type": part.media_type,
-                }.items()
-                if value is not None
-            },
-        }
-    return part.model_dump(exclude_none=True)
-
-
-def _history_part_source(part: LMImagePart | LMAudioPart | LMVideoPart | LMDocumentPart | LMBinaryPart) -> str | None:
-    if part.data is not None:
-        return part.data if part.data.startswith("data:") else f"data:{part.media_type};base64,{part.data}"
-    return part.url or part.file_id or part.path
-
-
-def _history_media_format(media_type: str) -> str:
-    return media_type.split("/", 1)[1] if "/" in media_type else media_type
-
-
-def _history_request_kwargs(request: LMRequest) -> dict[str, Any]:
-    return request.config.model_dump(exclude_none=True)
+def _lm_config_as_kwargs(config: LMConfig) -> dict[str, Any]:
+    data = config.model_dump(exclude_none=True)
+    extensions = data.pop("extensions", {}) or {}
+    return {**extensions, **data}
 
 
 def _validate_one_source(part: Any) -> None:
-    sources = {name: getattr(part, name) for name in ("data", "url", "file_id", "path") if getattr(part, name) is not None}
+    sources = {name: getattr(part, name) for name in _SOURCE_KEYS if getattr(part, name) is not None}
     class_name = type(part).__name__
     if len(sources) != 1:
         raise ValueError(f"{class_name} requires exactly one of data, url, file_id, or path.")
@@ -1686,139 +1553,6 @@ def _coerce_part(value: Any) -> LMPart:
     raise TypeError(f"Cannot convert {type(value)!r} to an LMPart.")
 
 
-def _parts_from_openai_content(content: Any) -> list[LMPart]:
-    if content is None:
-        return []
-    if isinstance(content, str):
-        return [LMTextPart(text=content)]
-    if not isinstance(content, list):
-        return [_coerce_part(content)]
-
-    parts = []
-    for item in content:
-        item_type = item.get("type") if isinstance(item, dict) else None
-        if item_type == "text":
-            parts.append(LMTextPart(text=item.get("text", "")))
-        elif item_type == "image_url":
-            url = item.get("image_url", {}).get("url", "")
-            parts.append(_image_source_to_part(url))
-        elif item_type == "input_audio":
-            audio = item.get("input_audio", {})
-            parts.append(LMAudioPart(data=audio.get("data"), media_type=f"audio/{audio.get('format', 'wav')}"))
-        elif item_type == "file":
-            parts.append(_binary_dict_to_part(item.get("file", {})))
-        elif item_type == "document":
-            parts.append(_document_dict_to_part(item))
-        elif item_type == "video":
-            video = item.get("video", {})
-            parts.append(_media_dict_to_video_part(video))
-        else:
-            parts.append(_coerce_part(item))
-    return parts
-
-
-def _tool_calls_from_openai(tool_calls: list[Any]) -> list[LMToolCallPart]:
-    return [_tool_call_from_openai(tool_call) for tool_call in tool_calls]
-
-
-def _tool_call_from_openai(tool_call: Any) -> LMToolCallPart:
-    if not isinstance(tool_call, Mapping):
-        part = _coerce_part(tool_call)
-        if isinstance(part, LMToolCallPart):
-            return part
-        raise TypeError(f"Cannot convert {type(tool_call)!r} to an LMToolCallPart.")
-
-    function = tool_call.get("function", {})
-    if not isinstance(function, Mapping):
-        function = {}
-
-    args = function.get("arguments", {})
-    if isinstance(args, str):
-        args = _parse_json_object(args)
-    elif isinstance(args, Mapping):
-        args = dict(args)
-    else:
-        args = {}
-
-    return LMToolCallPart(
-        id=tool_call.get("id"),
-        name=function.get("name") or tool_call.get("name") or "",
-        args=args,
-    )
-
-
-def _image_source_to_part(source: str) -> LMImagePart:
-    if source.startswith("data:"):
-        media_type, data = _split_data_uri(source)
-        return LMImagePart(data=data, media_type=media_type)
-    media_type = mimetypes.guess_type(urlparse(source).path)[0] or "image/png"
-    return LMImagePart(url=source, media_type=media_type)
-
-
-def _binary_dict_to_part(file: dict[str, Any]) -> LMBinaryPart:
-    if file.get("file_data") is not None:
-        media_type, data = _split_data_uri(file["file_data"])
-        return LMBinaryPart(data=data, media_type=media_type, filename=file.get("filename"))
-    if file.get("data") is not None:
-        media_type, data = _split_data_uri(file["data"])
-        return LMBinaryPart(data=data, media_type=media_type, filename=file.get("filename"))
-    if file.get("file_id") is not None:
-        return LMBinaryPart(file_id=file["file_id"], filename=file.get("filename"))
-    raise ValueError("Binary content block requires data, file_data, or file_id.")
-
-
-def _document_dict_to_part(item: dict[str, Any]) -> LMDocumentPart:
-    common = {"title": item.get("title"), "context": item.get("context")}
-    media_type = item.get("media_type") or "application/pdf"
-    for source_key in ("data", "url", "file_id", "path"):
-        if item.get(source_key) is not None:
-            return LMDocumentPart(**{source_key: item[source_key]}, media_type=media_type, **common)
-
-    source = item.get("source")
-    if isinstance(source, dict):
-        return LMDocumentPart(
-            source=source,
-            citations=item.get("citations") or {},
-            **common,
-        )
-    if isinstance(source, str):
-        kwargs = _media_source_kwargs(source, default_media_type=media_type)
-        return LMDocumentPart(**kwargs, **common)
-    raise ValueError("Document content block requires source.")
-
-
-def _media_dict_to_video_part(video: dict[str, Any]) -> LMVideoPart:
-    if video.get("data") is not None:
-        media_type, data = _split_data_uri(video["data"])
-        return LMVideoPart(data=data, media_type=media_type)
-    if video.get("url") is not None:
-        return LMVideoPart(url=video["url"], media_type=video.get("media_type") or "video/mp4")
-    if video.get("file_id") is not None:
-        return LMVideoPart(file_id=video["file_id"], media_type=video.get("media_type") or "video/mp4")
-    raise ValueError("Video content block requires data, url, or file_id.")
-
-
-def _split_data_uri(value: str) -> tuple[str, str]:
-    if not value.startswith("data:") or "," not in value:
-        return "application/octet-stream", value
-    header, data = value.split(",", 1)
-    media_type = header.removeprefix("data:").split(";", 1)[0]
-    return media_type, data
-
-
-def _media_source_kwargs(source: str, *, default_media_type: str) -> dict[str, str]:
-    if source.startswith("data:"):
-        media_type, data = _split_data_uri(source)
-        return {"data": data, "media_type": media_type}
-
-    parsed = urlparse(source)
-    if parsed.scheme in {"http", "https"}:
-        media_type = mimetypes.guess_type(parsed.path)[0] or default_media_type
-        return {"url": source, "media_type": media_type}
-
-    return {"file_id": source, "media_type": default_media_type}
-
-
 def _coerce_tool_spec(tool: Any) -> LMToolSpec:
     if isinstance(tool, LMToolSpec):
         return tool
@@ -1836,12 +1570,6 @@ def _coerce_tool_spec(tool: Any) -> LMToolSpec:
     raise TypeError(f"Cannot convert {type(tool)!r} to LMToolSpec.")
 
 
-def _requires_output_dict(output: LMOutput) -> bool:
-    return bool(
-        output.logprobs is not None or output.reasoning_content is not None or output.tool_calls or output.citations
-    )
-
-
 def _part_to_value(part: LMPart) -> Any:
     if isinstance(part, LMTextPart):
         return part.text
@@ -1854,17 +1582,10 @@ def _part_to_value(part: LMPart) -> Any:
     return part
 
 
-def _tool_call_to_provider_dict(call: LMToolCallPart) -> dict[str, Any]:
-    data = {
-        "type": "function",
-        "function": {
-            "name": call.name,
-            "arguments": json.dumps(call.args),
-        },
-    }
-    if call.id is not None:
-        data["id"] = call.id
-    return data
+def _finalize_stream_part(part: LMPart) -> LMPart:
+    if isinstance(part, LMToolCallPart) and "args_buffer" in part.provider_data:
+        return part.model_copy(update={"args": _parse_json_object_strict(part.provider_data["args_buffer"])})
+    return part
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:
@@ -1875,3 +1596,15 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_json_object_strict(value: str) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Streamed tool-call arguments must be a JSON object.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Streamed tool-call arguments must be a JSON object.")
+    return parsed
